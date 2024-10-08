@@ -6,50 +6,94 @@
 Юнит-тесты можно запустить командой ``dotnet test``
 ## Задание 3
 
-### Создание таблиц:
-
-```tsql
-CREATE TABLE Categories (
-    Id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
-    Name NVARCHAR(255) NOT NULL
-);
-
-CREATE TABLE Products (
-    Id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
-    Name NVARCHAR(255) NOT NULL
-);
-
--- Создание связующей таблицы для отношения "многие ко многим"
-CREATE TABLE ProductCategories (
-    ProductId UNIQUEIDENTIFIER NOT NULL,
-    CategoryId UNIQUEIDENTIFIER NOT NULL,
-    PRIMARY KEY (ProductId, CategoryId),
-    FOREIGN KEY (ProductId) REFERENCES Products(Id),
-    FOREIGN KEY (CategoryId) REFERENCES Categories(Id)
-);
-
-
-INSERT INTO Categories VALUES
-    ('02028FA5-CB78-432F-A5C2-6D4650999A61', 'Electronics'),
-    ('E55C3D85-78BA-4D70-99BE-5BA6131CC3B9', 'Clothes'),
-    ('EB246D57-8341-47C9-B145-D1524835AF2C', 'Food');
-
-INSERT INTO Products VALUES
-    ('8EC8A234-0364-46BC-854F-AFBA2B2CA9AE', 'Phone'),
-    ('4FE90DD4-6A17-41E9-ACCC-69699EEA3E45', 'Jeans'),
-    ('A9C49974-928C-47D3-BD00-31A07E53FBCE', 'Bread'),
-    ('28EB8578-9BD3-4704-B774-B613EA2237D2', 'Shampoo');
-
-INSERT INTO ProductCategories VALUES
-    ('8EC8A234-0364-46BC-854F-AFBA2B2CA9AE', '02028FA5-CB78-432F-A5C2-6D4650999A61'),
-    ('4FE90DD4-6A17-41E9-ACCC-69699EEA3E45', 'E55C3D85-78BA-4D70-99BE-5BA6131CC3B9'),
-    ('A9C49974-928C-47D3-BD00-31A07E53FBCE', 'EB246D57-8341-47C9-B145-D1524835AF2C');
+### Ход решения:
+- У нас kubernetes кластер, в котором пять нод.
+Для начала создается некоторый деплоймент с шаблоном контейнера внутри(идентификатор app). А также сервис, который служит единой точкой входа для обращения к контейнерам с меткой app.
+- Приложение испытывает постоянную стабильную нагрузку в течение суток без значительных колебаний. 3 пода справляются с нагрузкой.
+Для этого устанавливаем количество реплик на значение 3
+```yaml
+spec:
+  replicas: 3
 ```
+- Размещение подов на разных нодах для отказоустойчивости.
+Для этого используем политику __. Чтобы разместить поды на разных нодах, используем метку хостнейм
+```yaml
+    spec:
+      affinity: # Настройка размещения подов на разных нодах
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector: # метка идентифицирующая приложение
+              matchLabels:
+                app: app
+            topologyKey: "kubernetes.io/hostname"
+```
+- На первые запросы приложению требуется значительно больше ресурсов CPU, в дальнейшем потребление ровное в районе 0.1 CPU. По памяти всегда “ровно” в районе 128M memory.
 
-### Решение задания:
+Также здесь же необходимо установить лимиты, которые сам контейнер может потреблять, чтобы предотвратить, что контейнер будет мешать работе других контейнеров на этом ноде или произойдет неправильное масштабирование. 
+Однако, в условиях не даны конкретные цифры нод, поэтому опустим лимиты.
+- Приложение требует около 5-10 секунд для инициализации. Под не должен обрабатывать запросы до завершения инициализации.
+Под считается готовым, если готовы все контейнеры в нем. Достаточно к контейнеру добавить пробу на готовность. Это может быть легкий эндпоинт /health или команда shell.
+Проба происходит после 5 секунд от начала инициализации, каждые 5 секунд 3 раза
+```yaml
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 3
+```
+- Минимальное потребление ресурсов от этого deployment’а.
+Можно было бы сделать автоскалирование подов, т.к. в запасе у нас есть ещё 2 свободных нода. Однако, по условию задачи, нагрузка на сервер постоянная и с ней справляются 3 пода.
+Соответственно автоскалирование в данном случае не требуется.
+```yaml
 
-```tsql
-SELECT p.Name AS ProductName, c.Name AS CategoryName FROM Products AS p
-LEFT JOIN ProductCategories AS pc ON pc.ProductId = p.Id
-LEFT JOIN Categories AS c ON pc.CategoryId = c.Id
+# Доступ к
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-service
+spec:
+  selector:
+    app: app
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+
+####
+apiVersion: v1
+kind: Deployment
+metadata:
+  name: app-deployment
+spec:
+  replicas: 3 # Количество копий подов
+  selector:
+    matchLabels:
+      app: app
+  template:
+    metadata:
+      labels:
+        app: app
+      containers:
+      - image: some-container:latest
+        livenessProbe:  # проверка что контейнер запущен и работает (необходим эндпоинт)
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 3
+        resources: 
+          requests: # ресурсы, выделяемые на каждый запрос
+            cpu: 100m
+            memory: 128Mi
+    spec:
+      affinity: # Настройка размещения подов на разных нодах
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector: # метка идентифицирующая приложение
+              matchLabels:
+                app: app
+            topologyKey: "kubernetes.io/hostname" # Ключ, определяющий, что для подов нужны разные хосты
 ```
